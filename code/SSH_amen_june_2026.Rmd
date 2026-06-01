@@ -1,0 +1,437 @@
+---
+title: "Social Sensitivity"
+output: html_notebook
+---
+
+Estimating social sensitivity
+
+```{r}
+library(tidyverse)
+library(rstan)
+library(igraph)
+library(cmdstanr)
+library(posterior)
+library(dplyr)
+```
+
+
+
+# Get data ready
+
+```{r}
+load("all_obs_unique_comb_temp.RData")
+df.edges <- all_obs_unique_comb
+
+#give ids a number
+id_to_number <- data.frame(From = unique(c(df.edges$From,df.edges$To) ),To = unique(c(df.edges$From,df.edges$To) ), numb = as.numeric(as.factor(unique(c(df.edges$From,df.edges$To) ) ) ) )
+
+df.edges<-left_join(df.edges, id_to_number %>% dplyr::select(From, numb), "From")
+df.edges$from <- df.edges$numb
+df.edges <- df.edges %>% dplyr::select(-numb)
+
+df.edges<-left_join(df.edges , id_to_number %>% dplyr::select(To, numb), "To")
+df.edges$to <- df.edges$numb
+df.edges <- df.edges %>% dplyr::select(-numb)
+
+df.edges <- df.edges %>% dplyr::select(-From) %>% dplyr::select(-To)
+
+#add dyad id
+df.edges$dyad <- paste0(df.edges$from,"_",df.edges$to)
+df.edges$dyad <- as.numeric(as.factor(df.edges$dyad))
+
+#add indicator if sender is a lower number compared to reciever 
+df.edges$sr_indicator <- ifelse(df.edges$from < df.edges$to, 1,2)
+
+#make sure there are no missing data
+df.edges <- df.edges %>% tidyr::drop_na()
+
+#take a look
+df.edges
+
+#save(df.edges, file = "df_edges.RData")
+```
+
+Fix dyad id 
+-dyad is just the ordered pair of from and to actors
+-sr_indicator is the ordering of the pair. this should allow us to get back to the from/to columns from dyad
+```{r}
+df.edges$dyad<- ifelse(df.edges$from < df.edges$to, paste0(df.edges$from,"_",df.edges$to) , paste0(df.edges$to,"_",df.edges$from) ) 
+df.edges$dyad<- as.numeric(as.factor(df.edges$dyad))
+df.edges$sr_indicator<- ifelse(df.edges$from < df.edges$to, 1 , 2 ) 
+
+#check all is well
+df.edges[df.edges$dyad==11,]
+```
+
+For scaling
+```{r}
+scale2sd <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / (2 * sd(x, na.rm = TRUE))
+}
+```
+
+
+
+# AMEN model
+
+### Model 1 - k2 scaled
+
+Model with only main effects for the past social structures
+
+```{r}
+
+#prep the data
+data_stan <-list(n_nodes = nrow(id_to_number),
+                 n_dyads = max(df.edges$dyad),
+                 dyad_id = df.edges$dyad,
+                 scan_id = as.numeric(as.factor(df.edges$scanID)),
+                 scan_N = length(unique(df.edges$scanID)),
+                 sr_indicator = df.edges$sr_indicator,
+                 N = nrow(df.edges),
+                 sender_id = df.edges$from,
+                 receiver_id = df.edges$to,
+                 Y = df.edges$weight,
+                 past_weight = as.numeric(scale2sd(df.edges$past_weight)),
+                 past_aggro = as.numeric(scale2sd(df.edges$past_in_aggro)),
+                 past_reci = as.numeric(scale2sd(df.edges$past_reciprical)),
+                 past_trans = as.numeric(scale2sd(df.edges$past_transitive)),
+                 past_trans_agg = as.numeric(scale2sd(df.edges$past_transitive_aggro)),
+                 past_in_modu = as.numeric((df.edges$past_in_modu)),
+                 past_overall_modu = as.numeric(scale2sd(df.edges$past_overall_modu)),
+                 past_ndvi = as.numeric(scale2sd(df.edges$NDVI)),
+                 send_receive = df.edges$sr_indicator,
+                 troop = as.numeric(as.factor(df.edges$Troop)),
+                 K=2,
+                 troop_N = length(unique(df.edges$Troop)),
+                 useVI = 0
+                 )
+
+
+mod <- cmdstan_model("AMEN_observed_data_reduce_wPin_predP.stan", cpp_options = list(stan_threads = TRUE))
+
+parallel::detectCores()
+Sys.setenv(STAN_NUM_THREADS = 80)  # or more, depending on your system
+
+# Sample model briefly
+amen_main <- mod$sample(
+  data = data_stan,
+  chains = 4,
+  parallel_chains = 4,
+  threads_per_chain = 19,
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  init = 0.1,
+  max_treedepth = 12,
+  refresh = 10
+)
+
+
+
+amen_main$save_object(file = "fit_amen_obs_2015_predP.RDS")
+
+# can be read back in using readRDS
+#amen_main <- readRDS("fit_amen_obs_2015_predP.RDS")
+
+test<-amen_main$draws(variables = c(
+  "intercept", "b_weight", "b_reci", "b_aggro",
+  "b_trans", "b_trans_agg", "b_in_modu"
+))
+
+library(bayesplot)
+mcmc_trace(amen_main$draws(variables = c(
+  "intercept", "b_weight", "b_reci", "b_aggro",
+  "b_trans", "b_trans_agg", "b_in_modu"
+)))
+
+mcmc_trace(amen_main$draws(variables = c(
+  "z_multi_effects[1,3]","z_multi_effects[2,3]","z_multi_effects[3,3]","z_multi_effects[4,3]"
+)))
+
+mcmc_trace(amen_main$draws(variables = c(
+  "z_multi_effects[1,4]","z_multi_effects[2,4]","z_multi_effects[3,4]","z_multi_effects[4,4]"
+)))
+
+mcmc_trace(amen_main$draws(variables = c(
+  "sigma_nodes","sigma_multi_effects"
+)))
+
+
+amen_main$summary(variables = c(
+  "intercept", "b_weight", "b_reci", "b_aggro",
+  "b_trans", "b_trans_agg", "b_in_modu"
+))
+
+```
+
+
+```{r}
+subset_samples <- amen_main$draws(format = "draws_df")
+
+df_samples_main <- subset_samples %>% dplyr::select(contains("b_"))
+
+library(reshape2)
+colnames(df_samples_main) <- c("Gave grooming"  ,    "Received grooming"     ,    "Formed triadic closure (grooming)"     ,   "Was in same community" ,   "Received aggression"  , "Formed triadic closure (grooming & aggression)"  )
+df_samples_main_melt<-melt(df_samples_main)
+
+df_samples_main_melt$variable <- factor(df_samples_main_melt$variable, levels=c("Gave grooming"  ,    "Received grooming" ,     "Received aggression"    ,    "Formed triadic closure (grooming)"       , "Formed triadic closure (grooming & aggression)" ,   "Was in same community") )
+
+library(ggridges)
+ggplot(df_samples_main_melt %>% filter(variable != "b_overall_modu"), aes(y=variable, x=value) ) + geom_density_ridges(alpha=1, fill="skyblue", scale=0.95) + xlim(-0.1,0.45) + geom_vline(xintercept = 0, linetype="dashed", color="black") + theme_bw() + labs(y="Past social structure", x="Effect on current grooming") + theme(text = element_text(size = 20))
+
+```
+
+```{r}
+subset_samples <- amen_main$draws(format = "draws_df")
+model_p <- subset_samples %>% dplyr::select(contains("p_pred"))
+
+residuals <- data_stan$Y - model_p  # Or logit(Y) - mu_hat for latent scale residuals
+
+mean_residuals <- colMeans(residuals)   # posterior mean residuals
+mean_residuals[1] #the acf plots of the two models are so similar, just checking that they are different
+df_res <- data.frame(time= as.numeric(df.edges$date-min(df.edges$date)), resid = mean_residuals)
+df_res <- df_res %>% arrange(time)
+
+#ggplot(df_res, aes(x = time, y = resid)) +
+#  geom_line() + geom_smooth(method = "loess") +
+#  labs(title = "Residuals over Time")
+
+acf(df_res$resid, lag.max = 20, main = "ACF of Residuals")
+```
+
+### Model 2 - k2 scaled ENV
+
+The main model with adjustments for NDVI
+
+```{r}
+
+#prep the data
+data_stan <-list(n_nodes = nrow(id_to_number),
+                 n_dyads = max(df.edges$dyad),
+                 scan_id = as.numeric(as.factor(df.edges$scanID)),
+                 scan_N = length(unique(df.edges$scanID)),
+                 N = nrow(df.edges),
+                 sender_id = df.edges$from,
+                 receiver_id = df.edges$to,
+                 Y = df.edges$weight,
+                 past_weight = as.numeric(scale2sd(df.edges$past_weight)),
+                 past_aggro = as.numeric(scale2sd(df.edges$past_in_aggro)),
+                 past_reci = as.numeric(scale2sd(df.edges$past_reciprical)),
+                 past_trans = as.numeric(scale2sd(df.edges$past_transitive)),
+                 past_trans_agg = as.numeric(scale2sd(df.edges$past_transitive_aggro)),
+                 past_in_modu = as.numeric((df.edges$past_in_modu)), #as.numeric(scale2sd(df.edges$past_in_modu)),
+                 past_overall_modu = as.numeric(scale2sd(df.edges$past_overall_modu)),
+                 past_ndvi = as.numeric(scale2sd(df.edges$NDVI)),
+                 dyad_id = df.edges$dyad,
+                 send_receive = df.edges$sr_indicator,
+                 troop = as.numeric(as.factor(df.edges$Troop)),
+                 K=2,
+                 troop_N = length(unique(df.edges$Troop)),
+                 useVI=0
+                 )
+
+
+#fit small model
+library(cmdstanr)
+mod_ndvi <- cmdstan_model("AMEN_observed_data_NDIV_reduce_wPin_predP.stan", cpp_options = list(stan_threads = TRUE))
+
+Sys.setenv(STAN_NUM_THREADS = 80)  # or more, depending on your system
+amen_main_ndvi <- mod_ndvi$sample(data = data_stan,
+                  chains = 4,
+                  parallel_chains = 4,
+                  threads_per_chain = 19, 
+                  iter_warmup = 1000,
+                  init = 0.1,
+                  max_treedepth = 12,
+                  iter_sampling = 1000,
+                  refresh = 10)
+
+amen_main_ndvi$save_object(file = "fit_amen_obs_NDVI_2015.RDS")
+
+# can be read back in using readRDS
+#amen_main_ndvi <- readRDS("fit_amen_obs_NDVI_2015.RDS")
+
+library(bayesplot)
+mcmc_trace(amen_main_ndvi$draws(variables = c(
+  "intercept", "b_weight", "b_reci", "b_aggro",
+  "b_trans", "b_trans_agg", "b_in_modu", "troopID","sigma_troop"
+)))
+
+mcmc_trace(amen_main_ndvi$draws(variables = c(
+  "z_multi_effects[1,3]","z_multi_effects[2,3]","z_multi_effects[3,3]","z_multi_effects[4,3]"
+)))
+
+mcmc_trace(amen_main_ndvi$draws(variables = c(
+  "z_multi_effects[1,4]","z_multi_effects[2,4]","z_multi_effects[3,4]","z_multi_effects[4,4]"
+)))
+
+mcmc_trace(amen_main_ndvi$draws(variables = c(
+  "sigma_nodes","sigma_multi_effects"
+)))
+
+
+amen_main_ndvi$summary(variables = c(
+  "intercept", "b_weight", "b_reci", "b_aggro",
+  "b_trans", "b_trans_agg", "b_in_modu", "b_ndvi","b_ndvi_aggro","b_ndvi_weight",
+   "b_ndvi_reci",
+   "b_ndvi_trans" ,
+   "b_ndvi_trans_agg" ,
+   "b_ndvi_in_modu" , "troopID"
+))
+
+
+
+```
+
+Estimated effects plots
+```{r}
+
+
+hist(as.numeric(scale(df.edges$NDVI)))
+ci_ndvi<-HDInterval::hdi(as.numeric(scale(df.edges$NDVI)))
+low_ndvi = ci_ndvi[1]
+high_ndvi = ci_ndvi[2]
+
+
+library(reshape2)
+
+subset_samples_env<-as.data.frame(amen_main_ndvi$draws(variables = c(
+  "intercept", "b_weight", "b_reci", "b_aggro",
+  "b_trans", "b_trans_agg", "b_in_modu", "b_ndvi","b_ndvi_aggro","b_ndvi_weight",
+   "b_ndvi_reci",
+   "b_ndvi_trans" ,
+   "b_ndvi_trans_agg" ,
+   "b_ndvi_in_modu" 
+),
+    format = "draws_df")
+)
+
+df_samples_main_env_weight <- subset_samples_env %>% dplyr::select(b_weight, b_ndvi_weight)
+df_samples_main_env_weight  <- df_samples_main_env_weight %>% mutate(b_weight_low_NDVI=(b_weight + b_ndvi_weight * low_ndvi),b_weight_high_NDVI=(b_weight + b_ndvi_weight * high_ndvi)) %>% dplyr::select(b_weight_low_NDVI, b_weight_high_NDVI)
+df_samples_main_env_weight$parameter <- "Groom to"
+df_samples_main_env_weight_melt <- melt(df_samples_main_env_weight, id.vars = c("parameter") )
+df_char <- data.frame(variable = c("b_weight_low_NDVI","b_weight_high_NDVI" ), NDVI = c("low","high") ) 
+df_samples_main_env_weight_melt<-left_join(df_samples_main_env_weight_melt,df_char, by="variable")
+
+
+df_samples_main_env_reci <- subset_samples_env %>% dplyr::select(b_reci, b_ndvi_reci)
+df_samples_main_env_reci  <- df_samples_main_env_reci %>% mutate(b_reci_low_NDVI=(b_reci + b_ndvi_reci * low_ndvi),b_reci_high_NDVI=(b_reci + b_ndvi_reci * high_ndvi)) %>% dplyr::select(b_reci_low_NDVI, b_reci_high_NDVI)
+df_samples_main_env_reci$parameter <- "Groom from"
+df_samples_main_env_reci_melt <- melt(df_samples_main_env_reci, id.vars = c("parameter") )
+df_char <- data.frame(variable = c("b_reci_low_NDVI","b_reci_high_NDVI" ), NDVI = c("low","high") ) 
+df_samples_main_env_reci_melt<-left_join(df_samples_main_env_reci_melt,df_char, by="variable")
+
+
+df_samples_main_env_aggro <- subset_samples_env %>% dplyr::select(b_aggro, b_ndvi_aggro)
+df_samples_main_env_aggro  <- df_samples_main_env_aggro %>% mutate(b_aggro_low_NDVI=(b_aggro + b_ndvi_aggro * low_ndvi),b_aggro_high_NDVI=(b_aggro + b_ndvi_aggro * high_ndvi)) %>% dplyr::select(b_aggro_low_NDVI, b_aggro_high_NDVI)
+df_samples_main_env_aggro$parameter <- "Aggro from"
+df_samples_main_env_aggro_melt <- melt(df_samples_main_env_aggro, id.vars = c("parameter") )
+df_char <- data.frame(variable = c("b_aggro_low_NDVI","b_aggro_high_NDVI" ), NDVI = c("low","high") ) 
+df_samples_main_env_aggro_melt<-left_join(df_samples_main_env_aggro_melt,df_char, by="variable")
+
+df_samples_main_env_trans <- subset_samples_env %>% dplyr::select(b_trans, b_ndvi_trans)
+df_samples_main_env_trans  <- df_samples_main_env_trans %>% mutate(b_trans_low_NDVI=(b_trans + b_ndvi_trans * low_ndvi),b_trans_high_NDVI=(b_trans + b_ndvi_trans * high_ndvi)) %>% dplyr::select(b_trans_low_NDVI, b_trans_high_NDVI)
+df_samples_main_env_trans$parameter <- "Transitivity groom"
+df_samples_main_env_trans_melt <- melt(df_samples_main_env_trans, id.vars = c("parameter") )
+df_char <- data.frame(variable = c("b_trans_low_NDVI","b_trans_high_NDVI" ), NDVI = c("low","high") ) 
+df_samples_main_env_trans_melt<-left_join(df_samples_main_env_trans_melt,df_char, by="variable")
+
+df_samples_main_env_trans_agg <- subset_samples_env %>% dplyr::select(b_trans_agg, b_ndvi_trans_agg)
+df_samples_main_env_trans_agg  <- df_samples_main_env_trans_agg %>% mutate(b_trans_agg_low_NDVI=(b_trans_agg + b_ndvi_trans_agg * low_ndvi),b_trans_agg_high_NDVI=(b_trans_agg + b_ndvi_trans_agg * high_ndvi)) %>% dplyr::select(b_trans_agg_low_NDVI, b_trans_agg_high_NDVI)
+df_samples_main_env_trans_agg$parameter <- "Transitivity aggro"
+df_samples_main_env_trans_agg_melt <- melt(df_samples_main_env_trans_agg, id.vars = c("parameter") )
+df_char <- data.frame(variable = c("b_trans_agg_low_NDVI","b_trans_agg_high_NDVI" ), NDVI = c("low","high") ) 
+df_samples_main_env_trans_agg_melt<-left_join(df_samples_main_env_trans_agg_melt,df_char, by="variable")
+
+df_samples_main_env_in_modu <- subset_samples_env %>% dplyr::select(b_in_modu, b_ndvi_in_modu)
+df_samples_main_env_in_modu  <- df_samples_main_env_in_modu %>% mutate(b_in_modu_low_NDVI=(b_in_modu + b_ndvi_in_modu * low_ndvi),b_in_modu_high_NDVI=(b_in_modu + b_ndvi_in_modu * high_ndvi)) %>% dplyr::select(b_in_modu_low_NDVI, b_in_modu_high_NDVI)
+df_samples_main_env_in_modu$parameter <- "In community"
+df_samples_main_env_in_modu_melt <- melt(df_samples_main_env_in_modu, id.vars = c("parameter") )
+df_char <- data.frame(variable = c("b_in_modu_low_NDVI","b_in_modu_high_NDVI" ), NDVI = c("low","high") ) 
+df_samples_main_env_in_modu_melt<-left_join(df_samples_main_env_in_modu_melt,df_char, by="variable")
+
+#group them together
+df_bind <-bind_rows(df_samples_main_env_weight_melt,df_samples_main_env_reci_melt,df_samples_main_env_aggro_melt,df_samples_main_env_trans_melt,df_samples_main_env_trans_agg_melt, df_samples_main_env_in_modu_melt)
+
+library(ggridges)
+
+# Define custom colors
+custom_colors <- c("low" = "#66c2a5", "high" = "#238b45")  # Two shades of green
+
+colnames(df_samples_main) <- c("Gave grooming"  ,    "Received grooming"     ,    "Formed triadic closure (grooming)"     ,   "Was in same community" ,   "Received aggression"  , "Formed triadic closure (grooming & aggression)"  )
+df_samples_main_melt<-melt(df_samples_main)
+
+# Manually set the order of the levels for the parameter factor
+df_bind$parameter <- factor(df_bind$parameter, levels = c("Groom to" ,   "Groom from"  ,    "Aggro from" ,    "Transitivity groom" ,    "Transitivity aggro" ,"In community"  ))
+
+df_bind$parameter2 <- NA
+df_bind[df_bind$parameter=="Groom to",]$parameter2 <- "Gave grooming"
+df_bind[df_bind$parameter=="Groom from",]$parameter2 <- "Received grooming"
+df_bind[df_bind$parameter=="Aggro from",]$parameter2 <- "Received aggression"
+df_bind[df_bind$parameter=="Transitivity groom",]$parameter2 <- "Formed triadic closure (grooming)"
+df_bind[df_bind$parameter=="Transitivity aggro",]$parameter2 <- "Formed triadic closure (grooming & aggression)"
+df_bind[df_bind$parameter=="In community",]$parameter2 <- "Was in same community"
+
+df_bind$parameter2 <- factor(df_bind$parameter2, levels = c("Gave grooming" ,   "Received grooming"  ,    "Received aggression" ,    "Formed triadic closure (grooming)" ,    "Formed triadic closure (grooming & aggression)" ,"Was in same community"  ))
+
+ggplot(df_bind, aes() ) + geom_density_ridges(aes(y=parameter2, x=value, fill=NDVI) , alpha = 0.7,scale=0.95) + xlim(-0.7,1.0) + geom_vline(xintercept = 0, linetype="dashed", color="black")+ 
+  scale_fill_manual(values = custom_colors) +
+  labs(y="Past social structure", x="Effect on current grooming")+ theme_bw()+ theme(text = element_text(size = 20))
+
+
+```
+
+```{r}
+subset_samples_ndvi <- amen_main_ndvi$draws(format = "draws_df")
+model_p <- subset_samples_ndvi %>% dplyr::select(contains("p_pred"))
+
+residuals <- data_stan$Y - model_p  # Or logit(Y) - mu_hat for latent scale residuals
+
+mean_residuals <- colMeans(residuals)   # posterior mean residuals
+mean_residuals[1] #the acf plots of the two models are so similar, just checking that they are different
+df_res <- data.frame(time= as.numeric(df.edges$date-min(df.edges$date)), resid = mean_residuals)
+df_res <- df_res %>% arrange(time)
+
+#ggplot(df_res, aes(x = time, y = resid)) +
+#  geom_line() + geom_smooth(method = "loess") +
+#  labs(title = "Residuals over Time")
+
+acf(df_res$resid, lag.max = 20, main = "ACF of Residuals")
+```
+
+
+inter outputs
+
+Check where nodes are in latent space
+```{r}
+#add data together
+subset_samples_env_space<-as.data.frame(amen_main_ndvi$draws(variables = c(
+  "mean_multi_effects"
+),
+    format = "draws_df")
+)
+df_post_space_1 <- subset_samples_env_space %>% dplyr::select(contains(",1]"))
+df_post_space_2 <- subset_samples_env_space %>% dplyr::select(contains(",2]"))
+df_post_space_3 <- subset_samples_env_space %>% dplyr::select(contains(",3]"))
+df_post_space_4 <- subset_samples_env_space %>% dplyr::select(contains(",4]"))
+
+
+#make a plot of the senders
+x_sender <- df_post_space_1[1,]
+y_sender <- df_post_space_2[1,]
+x_receiver <- df_post_space_3[1,]
+y_receiver <- df_post_space_4[1,]
+
+df_latent_space_plot <- data.frame(x_sender=t(x_sender), y_sender=t(y_sender), x_receiver=t(x_receiver), y_receiver=t(y_receiver), numb = 1:72) #44
+
+df_latent_space_plot <- left_join(df_latent_space_plot,id_to_number, by="numb")
+colnames(df_latent_space_plot)[1:4] <- c("sender_x", "sender_y", "receiver_x","receiver_y")
+#ggplot(df_latent_space_plot, aes(x=sender_x, y=sender_y, label=From)) + geom_text(color="blue") +
+#  geom_text(aes(x=receiver_x, y=receiver_y), color="red" ) + theme_bw() +xlim(-0.5,0.5)+ylim(-0.5,0.5)
+
+ggplot(df_latent_space_plot, aes(x=sender_x, y=sender_y, label=From)) + geom_text(color="blue") +
+  geom_text(aes(x=receiver_x, y=receiver_y), color="red" ) + theme_bw() #+xlim(-0.5,0.5)+ylim(-0.5,0.5)
+
+
+```
+
+
